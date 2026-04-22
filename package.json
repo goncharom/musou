@@ -1,0 +1,19 @@
+{
+  "name": "pi-musou",
+  "version": "0.1.0",
+  "description": "Musou extension for pi: learn from session behavior and propose AGENTS/skill improvements.",
+  "license": "MIT",
+  "keywords": ["pi-package"],
+  "files": ["musou", "README.md"],
+  "dependencies": {
+    "diff": "^7.0.0"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*",
+    "@sinclair/typebox": "*"
+  },
+  "pi": {
+    "extensions": ["./musou/index.ts"]
+  }
+}
