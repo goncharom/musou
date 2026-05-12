@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { access, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import {
   SessionManager,
   withFileMutationQueue,
@@ -20,17 +20,33 @@ type ProposalTarget =
   | `project-skill:${string}`;
 
 type ReviewAction = "accept" | "discard" | "quit";
-
 type MusouRunSource = "auto" | "manual";
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 type MusouMessage = { role?: string; content?: unknown };
+type TargetKind = "single-file" | "skill-dir";
+
+interface ManagedTargetFile {
+  relativePath: string;
+  absolutePath: string;
+  content: string;
+  cap: number;
+}
+
+interface ProposalFileChange {
+  relativePath: string;
+  absolutePath: string;
+  originalContent: string | null;
+  proposedContent: string;
+  cap: number;
+}
 
 interface Proposal {
   target: ProposalTarget;
   reason: string;
-  proposed_content: string;
-  originalPath: string;
-  originalContent: string;
+  targetPath: string;
+  targetKind: TargetKind;
+  targetLabel: string;
+  fileChanges: ProposalFileChange[];
 }
 
 interface ActiveMusouRun {
@@ -57,16 +73,22 @@ interface MusouConfig {
 
 interface MusouTargetFile {
   target: ProposalTarget;
+  kind: TargetKind;
   path: string;
   label: string;
-  content: string;
-  cap: number;
+  files: ManagedTargetFile[];
+}
+
+interface ParsedProposalFile {
+  path?: string;
+  content?: string;
 }
 
 interface ParsedProposal {
   target: string;
   reason: string;
-  proposed_content: string;
+  proposed_content?: string;
+  files?: ParsedProposalFile[];
 }
 
 interface MusouRunFiles {
@@ -143,7 +165,7 @@ export default function musouExtension(pi: ExtensionAPI): void {
       const lines = [
         "💭 Musou analyzing session in the background...",
         `Source: ${state.activeRun?.source ?? "manual"}`,
-        `Target files: ${targets.length}`,
+        `Targets: ${targets.length}`,
       ];
       ctx.ui.setWidget("musou", lines, { placement: "aboveEditor" });
     }, PROGRESS_WIDGET_DELAY_MS);
@@ -468,10 +490,13 @@ export default function musouExtension(pi: ExtensionAPI): void {
         `  Thinking level: ${config.thinkingLevel}`,
         `  Last musou: ${state.lastMusouAt ? new Date(state.lastMusouAt).toLocaleString() : "never"}`,
         `  Pending: ${state.pendingProposals?.length ?? 0}`,
-        `  Target files: ${targets.length}`,
+        `  Targets: ${targets.length}`,
         `  Last session fingerprint: ${state.lastSessionFingerprint ?? "none"}`,
         `  Active run: ${state.activeRun ? `${state.activeRun.source} (${state.activeRun.tempDir})` : "none"}`,
-        ...targets.map((target) => `    ${target.path} (${target.content.length} / ${target.cap} chars)`),
+        ...targets.map((target) => {
+          const charCount = target.files.reduce((sum, file) => sum + file.content.length, 0);
+          return `    ${target.path} (${target.files.length} files, ${charCount} chars)`;
+        }),
       ];
       if (state.lastError) lines.push(`  Last error: ${state.lastError}`);
       ctx.ui.notify(lines.join("\n"), "info");
@@ -487,10 +512,28 @@ function restoreMusouState(ctx: ExtensionContext): MusouState {
     | { data?: Partial<MusouState> }
     | undefined;
 
-  return {
+  const restored = {
     ...DEFAULT_STATE,
     ...(last?.data ?? {}),
   };
+
+  return {
+    ...restored,
+    pendingProposals: isStoredProposalArray(restored.pendingProposals) ? restored.pendingProposals : null,
+  };
+}
+
+function isStoredProposalArray(value: unknown): value is Proposal[] {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (proposal) =>
+        proposal &&
+        typeof proposal === "object" &&
+        Array.isArray((proposal as Proposal).fileChanges) &&
+        typeof (proposal as Proposal).targetPath === "string",
+    )
+  );
 }
 
 async function loadConfig(ctx: ExtensionContext): Promise<MusouConfig> {
@@ -514,15 +557,15 @@ async function discoverTargetFiles(ctx: ExtensionContext, config: MusouConfig): 
   const targets: MusouTargetFile[] = [];
   const agentDir = getAgentDir();
 
-  await maybeAddTarget(targets, resolve(agentDir, "AGENTS.md"), "global-agents", "Global AGENTS.md", config);
-  await maybeAddTarget(targets, resolve(ctx.cwd, "AGENTS.md"), "project-agents", "Project AGENTS.md", config);
+  await maybeAddSingleFileTarget(targets, resolve(agentDir, "AGENTS.md"), "global-agents", "Global AGENTS.md", config);
+  await maybeAddSingleFileTarget(targets, resolve(ctx.cwd, "AGENTS.md"), "project-agents", "Project AGENTS.md", config);
   await addSkillTargets(targets, resolve(agentDir, "skills"), "global", config);
   await addSkillTargets(targets, resolve(ctx.cwd, ".pi/skills"), "project", config);
 
   return targets;
 }
 
-async function maybeAddTarget(
+async function maybeAddSingleFileTarget(
   targets: MusouTargetFile[],
   path: string,
   target: ProposalTarget,
@@ -533,7 +576,13 @@ async function maybeAddTarget(
     await access(path);
     const content = await readFile(path, "utf8");
     const cap = await readMusouCap(path, config.maxFileLengthChars, content);
-    targets.push({ target, path, label, content, cap });
+    targets.push({
+      target,
+      kind: "single-file",
+      path,
+      label,
+      files: [{ relativePath: basename(path), absolutePath: path, content, cap }],
+    });
   } catch {
     // ignore missing files
   }
@@ -551,23 +600,41 @@ async function addSkillTargets(
     return;
   }
 
-  for (const relativePath of await walkSkillFiles(root, root)) {
-    const path = resolve(root, relativePath);
-    const content = await readFile(path, "utf8");
-    const cap = await readMusouCap(path, config.maxFileLengthChars, content);
-    const fileName = relativePath.replace(/\\/g, "/");
+  const entries = await discoverSkillEntries(root, root);
+  for (const entry of entries) {
+    const targetPrefix = scope === "global" ? "global-skill:" : "project-skill:";
+    if (entry.kind === "root-markdown") {
+      const absolutePath = resolve(root, entry.relativePath);
+      const content = await readFile(absolutePath, "utf8");
+      const cap = await readMusouCap(absolutePath, config.maxFileLengthChars, content);
+      targets.push({
+        target: `${targetPrefix}${entry.relativePath}` as ProposalTarget,
+        kind: "single-file",
+        path: absolutePath,
+        label: `${scope === "global" ? "Global" : "Project"} root skill: ${entry.relativePath}`,
+        files: [{ relativePath: entry.relativePath, absolutePath, content, cap }],
+      });
+      continue;
+    }
+
+    const skillRoot = resolve(root, entry.relativePath);
+    const files = await collectSkillBundleFiles(skillRoot, config.maxFileLengthChars);
+    if (files.length === 0) continue;
     targets.push({
-      target: `${scope}-skill:${fileName}` as ProposalTarget,
-      path,
-      label: `${scope === "global" ? "Global" : "Project"} skill: ${fileName}`,
-      content,
-      cap,
+      target: `${targetPrefix}${entry.relativePath.replace(/\\/g, "/")}` as ProposalTarget,
+      kind: "skill-dir",
+      path: skillRoot,
+      label: `${scope === "global" ? "Global" : "Project"} skill: ${entry.relativePath.replace(/\\/g, "/")}`,
+      files,
     });
   }
 }
 
-async function walkSkillFiles(root: string, current: string): Promise<string[]> {
-  const results: string[] = [];
+async function discoverSkillEntries(
+  root: string,
+  current: string,
+): Promise<Array<{ kind: "root-markdown" | "skill-dir"; relativePath: string }>> {
+  const results: Array<{ kind: "root-markdown" | "skill-dir"; relativePath: string }> = [];
   const entries = await readdir(current, { withFileTypes: true });
 
   for (const entry of entries) {
@@ -577,37 +644,85 @@ async function walkSkillFiles(root: string, current: string): Promise<string[]> 
       const skillFile = join(fullPath, "SKILL.md");
       try {
         await access(skillFile);
-        results.push(skillFile.slice(root.length + 1));
+        results.push({ kind: "skill-dir", relativePath: fullPath.slice(root.length + 1) });
         continue;
       } catch {
-        results.push(...(await walkSkillFiles(root, fullPath)));
+        results.push(...(await discoverSkillEntries(root, fullPath)));
       }
       continue;
     }
 
     if (current === root && entry.isFile() && entry.name.endsWith(".md")) {
-      results.push(entry.name);
+      results.push({ kind: "root-markdown", relativePath: entry.name });
     }
   }
 
-  return results.sort((a, b) => a.localeCompare(b));
+  return results.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
 }
 
-function buildMusouPrompt(targets: MusouTargetFile[], cwd: string): string {
+async function collectSkillBundleFiles(skillRoot: string, defaultCap: number): Promise<ManagedTargetFile[]> {
+  const files: ManagedTargetFile[] = [];
+  await walkSkillBundleFiles(skillRoot, skillRoot, files, defaultCap);
+  return files.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+}
+
+async function walkSkillBundleFiles(
+  skillRoot: string,
+  current: string,
+  files: ManagedTargetFile[],
+  defaultCap: number,
+): Promise<void> {
+  const entries = await readdir(current, { withFileTypes: true });
+
+  for (const entry of entries) {
+    if (entry.name === "node_modules" || entry.name.startsWith(".")) continue;
+    const absolutePath = join(current, entry.name);
+
+    if (entry.isDirectory()) {
+      await walkSkillBundleFiles(skillRoot, absolutePath, files, defaultCap);
+      continue;
+    }
+
+    if (!entry.isFile()) continue;
+    const buffer = await readFile(absolutePath);
+    if (!isProbablyTextFile(buffer)) continue;
+    const content = buffer.toString("utf8");
+    const cap = await readMusouCap(absolutePath, defaultCap, content);
+    files.push({
+      relativePath: absolutePath.slice(skillRoot.length + 1).replace(/\\/g, "/"),
+      absolutePath,
+      content,
+      cap,
+    });
+  }
+}
+
+function buildMusouPrompt(targets: MusouTargetFile[], cwd: string, config: MusouConfig): string {
   const sections: string[] = [
     "You are analyzing the current pi session already loaded in this subprocess to identify improvements to persistent instruction files.",
     "Use the session history available in context to detect repeated mistakes, requests, workflows, or preferences worth capturing.",
     "Your output must be a JSON array of proposals and nothing else — no preamble, no explanation, no markdown fences.",
-    "\n## Current file contents\n",
+    `Default per-file character cap for NEW files: ${config.maxFileLengthChars}`,
+    "",
+    "## Current file contents",
+    "",
   ];
 
   const globalSkillRoot = resolve(getAgentDir(), "skills");
   const projectSkillRoot = resolve(cwd, ".pi/skills");
 
   for (const target of targets) {
-    sections.push(
-      `=== ${target.label.toUpperCase()} ===\nPath: ${target.path}\nCurrent length: ${target.content.length} / ${target.cap} characters (cap)\n---\n${target.content}\n---\n`,
-    );
+    sections.push(`=== ${target.label.toUpperCase()} ===`);
+    sections.push(`Target id: ${target.target}`);
+    sections.push(`Target kind: ${target.kind}`);
+    sections.push(`Target path: ${target.path}`);
+    sections.push(`Managed text files: ${target.files.length}`);
+    for (const file of target.files) {
+      sections.push(`--- FILE ${file.relativePath} (${file.content.length} / ${file.cap} chars cap) ---`);
+      sections.push(file.content);
+      sections.push("--- END FILE ---");
+    }
+    sections.push("");
   }
 
   sections.push(renderMusouPromptInstructions(globalSkillRoot, projectSkillRoot));
@@ -633,7 +748,7 @@ async function spawnMusouRun(
     const forkedFile = forkedManager.getSessionFile();
     if (!forkedFile) throw new Error("Forked session file was not created.");
 
-    await writeFile(promptPath, buildMusouPrompt(targets, ctx.cwd), "utf8");
+    await writeFile(promptPath, buildMusouPrompt(targets, ctx.cwd, config), "utf8");
     await writeFile(files.targetsPath, JSON.stringify(targets), "utf8");
     await writeFile(files.configPath, JSON.stringify(config), "utf8");
     await writeFile(fingerprintPath, fingerprint, "utf8");
@@ -714,20 +829,104 @@ function stripOuterMarkdownFence(raw: string): string {
 }
 
 function normalizeProposal(proposal: ParsedProposal, targets: MusouTargetFile[], config: MusouConfig, cwd: string): Proposal | null {
-  if (typeof proposal.reason !== "string" || typeof proposal.proposed_content !== "string") return null;
+  if (typeof proposal.target !== "string") return null;
+  if (typeof proposal.reason !== "string" || proposal.reason.trim() === "") return null;
 
   const existingTarget = targets.find((item) => item.target === proposal.target);
-  const target = existingTarget ?? createNewSkillTarget(proposal.target, targets, config, cwd);
+  const target = existingTarget ?? createNewSkillTarget(proposal.target, cwd);
   if (!target) return null;
-  if (proposal.proposed_content.length > target.cap) return null;
-  if (proposal.proposed_content === target.content) return null;
+
+  const rawFiles = normalizeProposalFileInputs(proposal, target);
+  if (!rawFiles || rawFiles.length === 0) return null;
+
+  const existingByPath = new Map(target.files.map((file) => [normalizePathKey(file.relativePath), file]));
+  const seen = new Set<string>();
+  const fileChanges: ProposalFileChange[] = [];
+
+  for (const rawFile of rawFiles) {
+    const normalized = normalizeProposalFile(rawFile, target, config.maxFileLengthChars);
+    if (!normalized) return null;
+
+    const pathKey = normalizePathKey(normalized.relativePath);
+    if (seen.has(pathKey)) return null;
+    seen.add(pathKey);
+
+    const existingFile = existingByPath.get(pathKey);
+    const cap = existingFile?.cap ?? config.maxFileLengthChars;
+    if (normalized.content.length > cap) return null;
+    if (existingFile && existingFile.content === normalized.content) continue;
+
+    fileChanges.push({
+      relativePath: normalized.relativePath,
+      absolutePath: normalized.absolutePath,
+      originalContent: existingFile?.content ?? null,
+      proposedContent: normalized.content,
+      cap,
+    });
+  }
+
+  if (target.kind === "skill-dir") {
+    const hasSkillFile = rawFiles.some((file) => normalizePathKey(file.path ?? "") === "skill.md");
+    if (target.files.length === 0 && !hasSkillFile) return null;
+  }
+
+  if (fileChanges.length === 0) return null;
 
   return {
     target: target.target,
     reason: proposal.reason,
-    proposed_content: proposal.proposed_content,
-    originalPath: target.path,
-    originalContent: target.content,
+    targetPath: target.path,
+    targetKind: target.kind,
+    targetLabel: target.label,
+    fileChanges: fileChanges.sort((a, b) => a.relativePath.localeCompare(b.relativePath)),
+  };
+}
+
+function normalizeProposalFileInputs(proposal: ParsedProposal, target: MusouTargetFile): ParsedProposalFile[] | null {
+  if (Array.isArray(proposal.files)) {
+    return proposal.files;
+  }
+
+  if (typeof proposal.proposed_content !== "string") return null;
+  if (target.kind !== "single-file" || target.files.length !== 1) return null;
+
+  return [{ path: target.files[0]!.relativePath, content: proposal.proposed_content }];
+}
+
+function normalizeProposalFile(
+  proposalFile: ParsedProposalFile,
+  target: MusouTargetFile,
+  defaultCap: number,
+): { relativePath: string; absolutePath: string; content: string } | null {
+  if (typeof proposalFile.path !== "string" || typeof proposalFile.content !== "string") return null;
+
+  if (target.kind === "single-file") {
+    const expectedFile = target.files[0];
+    if (!expectedFile) return null;
+    const normalizedExpected = normalizePathKey(expectedFile.relativePath);
+    const normalizedActual = normalizePathKey(proposalFile.path);
+    if (normalizedActual !== normalizedExpected) return null;
+    if (proposalFile.content.length > expectedFile.cap) return null;
+    return {
+      relativePath: expectedFile.relativePath,
+      absolutePath: expectedFile.absolutePath,
+      content: proposalFile.content,
+    };
+  }
+
+  const safeRelativePath = sanitizeRelativeSkillFilePath(proposalFile.path);
+  if (!safeRelativePath) return null;
+
+  const absolutePath = resolve(target.path, safeRelativePath);
+  if (!isPathInsideRoot(absolutePath, target.path)) return null;
+  if (proposalFile.content.length > defaultCap && !target.files.some((file) => normalizePathKey(file.relativePath) === normalizePathKey(safeRelativePath))) {
+    return null;
+  }
+
+  return {
+    relativePath: safeRelativePath,
+    absolutePath,
+    content: proposalFile.content,
   };
 }
 
@@ -769,18 +968,27 @@ async function reviewPendingProposals(
 }
 
 async function applyProposal(pi: ExtensionAPI, ctx: ExtensionCommandContext, proposal: Proposal): Promise<boolean> {
+  const queueKey = proposal.targetKind === "skill-dir" ? proposal.targetPath : proposal.fileChanges[0]?.absolutePath ?? proposal.targetPath;
+
   try {
-    await withFileMutationQueue(proposal.originalPath, async () => {
-      await mkdir(dirname(proposal.originalPath), { recursive: true });
-      await writeFile(proposal.originalPath, proposal.proposed_content, "utf8");
+    await withFileMutationQueue(queueKey, async () => {
+      for (const change of proposal.fileChanges) {
+        await mkdir(dirname(change.absolutePath), { recursive: true });
+        await writeFile(change.absolutePath, change.proposedContent, "utf8");
+      }
     });
 
     pi.sendMessage(
       {
         customType: "musou-applied",
-        content: `✓ Applied musou improvement to ${proposal.originalPath}`,
+        content: `✓ Applied musou improvement to ${proposal.targetPath}`,
         display: true,
-        details: { path: proposal.originalPath, reason: proposal.reason, target: proposal.target },
+        details: {
+          path: proposal.targetPath,
+          files: proposal.fileChanges.map((file) => file.absolutePath),
+          reason: proposal.reason,
+          target: proposal.target,
+        },
       },
       { deliverAs: "nextTurn" },
     );
@@ -797,7 +1005,7 @@ async function reviewProposalUi(
   index: number,
   total: number,
 ): Promise<ReviewAction> {
-  const diffLines = buildDiffLines(proposal.originalContent, proposal.proposed_content);
+  const diffLines = buildProposalDiffLines(proposal);
 
   return ctx.ui.custom<ReviewAction>((tui, theme, _kb, done) => {
     let scroll = 0;
@@ -812,9 +1020,12 @@ async function reviewProposalUi(
           theme.fg("accent", theme.bold(`Musou Proposal ${index} of ${total}`)),
           rule,
           section("Target"),
-          `${proposal.originalPath}`,
+          `${proposal.targetLabel}`,
+          `${proposal.targetPath}`,
           section("Reason"),
           `${proposal.reason}`,
+          section("Files"),
+          ...proposal.fileChanges.map((file) => `- ${file.relativePath}${file.originalContent === null ? " (new)" : ""}`),
           section("Controls"),
           theme.fg("dim", "[A] Accept   [D] Discard   [Q] Quit   [↑↓/j/k] Scroll"),
           theme.fg(
@@ -829,6 +1040,7 @@ async function reviewProposalUi(
           if (line.startsWith("+ ")) return theme.fg("success", line);
           if (line.startsWith("- ")) return theme.fg("error", line);
           if (line.startsWith("@@") || line.startsWith("---") || line.startsWith("+++")) return theme.fg("accent", line);
+          if (line.startsWith("===")) return theme.fg("accent", theme.bold(line));
           return line;
         });
 
@@ -875,6 +1087,18 @@ async function reviewProposalUi(
       },
     };
   });
+}
+
+function buildProposalDiffLines(proposal: Proposal): string[] {
+  const lines: string[] = [];
+
+  for (const change of proposal.fileChanges) {
+    lines.push(`=== ${change.relativePath} ===`);
+    lines.push(...buildDiffLines(change.originalContent ?? "", change.proposedContent));
+    lines.push("");
+  }
+
+  return lines.length > 0 ? lines : ["@@", "  (no visible file changes)"];
 }
 
 function buildDiffLines(original: string, proposed: string): string[] {
@@ -938,7 +1162,7 @@ function normalizeThinkingLevel(value: unknown, fallback: ThinkingLevel): Thinki
     : fallback;
 }
 
-function createNewSkillTarget(targetId: string, targets: MusouTargetFile[], config: MusouConfig, cwd: string): MusouTargetFile | null {
+function createNewSkillTarget(targetId: string, cwd: string): MusouTargetFile | null {
   if (!isProposalTarget(targetId)) return null;
   if (!targetId.startsWith("global-skill:") && !targetId.startsWith("project-skill:")) return null;
 
@@ -946,18 +1170,15 @@ function createNewSkillTarget(targetId: string, targets: MusouTargetFile[], conf
   if (!skillName || !isSafeSkillName(skillName)) return null;
 
   const skillRoot = scope === "global-skill" ? resolve(getAgentDir(), "skills") : resolve(cwd, ".pi/skills");
-  const path = resolve(skillRoot, skillName, "SKILL.md");
-  if (!path.startsWith(skillRoot)) return null;
-
-  const existingScopeTarget = targets.find((item) => item.target === targetId);
-  if (existingScopeTarget) return existingScopeTarget;
+  const path = resolve(skillRoot, skillName);
+  if (!isPathInsideRoot(path, skillRoot)) return null;
 
   return {
     target: targetId,
+    kind: "skill-dir",
     path,
     label: `${scope === "global-skill" ? "Global" : "Project"} skill: ${skillName}`,
-    content: "",
-    cap: config.maxFileLengthChars,
+    files: [],
   };
 }
 
@@ -967,7 +1188,32 @@ function isProposalTarget(value: string): value is ProposalTarget {
 
 function isSafeSkillName(skillName: string): boolean {
   if (skillName.trim() === "") return false;
-  return /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(skillName);
+  return /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(skillName) && skillName.length <= 64;
+}
+
+function sanitizeRelativeSkillFilePath(value: string): string | null {
+  const normalized = value.replace(/\\/g, "/").trim();
+  if (!normalized || normalized.startsWith("/")) return null;
+  if (normalized.split("/").some((segment) => segment === "" || segment === "." || segment === "..")) return null;
+  return normalized;
+}
+
+function normalizePathKey(value: string): string {
+  return value.replace(/\\/g, "/").trim().toLowerCase();
+}
+
+function isPathInsideRoot(path: string, root: string): boolean {
+  const normalizedPath = resolve(path);
+  const normalizedRoot = resolve(root);
+  return normalizedPath === normalizedRoot || normalizedPath.startsWith(`${normalizedRoot}${sep}`);
+}
+
+function isProbablyTextFile(buffer: Buffer): boolean {
+  const sample = buffer.subarray(0, Math.min(buffer.length, 4096));
+  for (const byte of sample) {
+    if (byte === 0) return false;
+  }
+  return true;
 }
 
 function getAgentDir(): string {

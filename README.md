@@ -1,6 +1,6 @@
 # pi-musou
 
-Musou is a small pi extension that watches your session and proposes improvements to existing `AGENTS.md` files and skill docs.
+Musou is a small pi extension that watches your session and proposes improvements to existing `AGENTS.md` files and skills, including multi-file skill bundles.
 
 ## What it does
 
@@ -85,7 +85,7 @@ Musou proposes changes for existing files under:
 - `~/.pi/agent/skills/**/*.md`
 - `.pi/skills/**/*.md`
 
-It can also propose new skill markdown files under the skill roots above.
+It can also propose new skills under the skill roots above, including `SKILL.md` plus supporting text files like scripts, references, examples, and templates.
 
 ## Notes
 
