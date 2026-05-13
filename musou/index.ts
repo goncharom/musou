@@ -9,9 +9,8 @@ import {
   type ExtensionCommandContext,
   type ExtensionContext,
 } from "@mariozechner/pi-coding-agent";
-import { structuredPatch } from "diff";
-import { Key, matchesKey, truncateToWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
 import { renderMusouPromptInstructions } from "./prompt";
+import { MusouReviewOverlay, type ReviewAction } from "./review-overlay";
 
 type ProposalTarget =
   | "global-agents"
@@ -19,7 +18,6 @@ type ProposalTarget =
   | `global-skill:${string}`
   | `project-skill:${string}`;
 
-type ReviewAction = "accept" | "discard" | "quit";
 type MusouRunSource = "auto" | "manual";
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 type MusouMessage = { role?: string; content?: unknown };
@@ -107,12 +105,16 @@ interface MusouRunResult {
   timedOut: boolean;
 }
 
+interface JsonModeAssistantOutput {
+  text: string;
+  errorMessage: string | null;
+}
+
 const MUSOU_STATE_TYPE = "musou-state";
 const MUSOU_NO_RECURSE_ENV = "MUSOU_NO_RECURSE";
-const REVIEW_VIEWPORT_LINES = 28;
-const REVIEW_DIFF_CONTEXT_LINES = 3;
 const RUNNER_POLL_MS = 2000;
 const PROGRESS_WIDGET_DELAY_MS = 5000;
+const MUSOU_RUN_TRIGGER_PROMPT = "Analyze the current session now and return exactly one JSON array with no prose.";
 
 const DEFAULT_STATE: MusouState = {
   entryCount: 0,
@@ -331,8 +333,33 @@ export default function musouExtension(pi: ExtensionAPI): void {
         return;
       }
 
-      const raw = (rawStdout ?? "").trim();
-      const parsed = parseProposalArray(raw);
+      const assistantOutput = parseJsonModeAssistantOutput(rawStdout ?? "");
+      if (!assistantOutput) {
+        state.lastError = truncate(rawStderr || rawStdout || "Musou subprocess did not emit an assistant message in JSON mode.", 600);
+        persistState();
+        updateMusouStatus(ctx);
+        ctx.ui.notify("💭 Musou failed — invalid JSON. Check /musou-status for details.", "error");
+        return;
+      }
+
+      if (assistantOutput.errorMessage) {
+        state.lastError = truncate(assistantOutput.errorMessage, 600);
+        persistState();
+        updateMusouStatus(ctx);
+        ctx.ui.notify("💭 Musou failed — subprocess error. Check /musou-status for details.", "error");
+        return;
+      }
+
+      const assistantText = assistantOutput.text.trim();
+      if (!assistantText) {
+        state.lastError = "Musou assistant returned empty text output.";
+        persistState();
+        updateMusouStatus(ctx);
+        ctx.ui.notify("💭 Musou failed — invalid JSON. Check /musou-status for details.", "error");
+        return;
+      }
+
+      const parsed = parseProposalArray(assistantText);
       if (parsed.ok === false) {
         state.lastError = parsed.error;
         persistState();
@@ -698,18 +725,22 @@ async function walkSkillBundleFiles(
 }
 
 function buildMusouPrompt(targets: MusouTargetFile[], cwd: string, config: MusouConfig): string {
+  const globalSkillRoot = resolve(getAgentDir(), "skills");
+  const projectSkillRoot = resolve(cwd, ".pi/skills");
+
   const sections: string[] = [
     "You are analyzing the current pi session already loaded in this subprocess to identify improvements to persistent instruction files.",
     "Use the session history available in context to detect repeated mistakes, requests, workflows, or preferences worth capturing.",
-    "Your output must be a JSON array of proposals and nothing else — no preamble, no explanation, no markdown fences.",
+    renderMusouPromptInstructions(globalSkillRoot, projectSkillRoot),
+    "",
     `Default per-file character cap for NEW files: ${config.maxFileLengthChars}`,
     "",
-    "## Current file contents",
+    "What follows is the content of the managed target files. It is provided for reference only so you can construct exact replacement file contents.",
+    "Do not comment on these files outside the required JSON array output.",
+    "",
+    "## Reference target files",
     "",
   ];
-
-  const globalSkillRoot = resolve(getAgentDir(), "skills");
-  const projectSkillRoot = resolve(cwd, ".pi/skills");
 
   for (const target of targets) {
     sections.push(`=== ${target.label.toUpperCase()} ===`);
@@ -725,7 +756,6 @@ function buildMusouPrompt(targets: MusouTargetFile[], cwd: string, config: Musou
     sections.push("");
   }
 
-  sections.push(renderMusouPromptInstructions(globalSkillRoot, projectSkillRoot));
   return sections.join("\n");
 }
 
@@ -758,12 +788,18 @@ async function spawnMusouRun(
       args: [
         "--session",
         forkedFile,
-        "--print",
+        "--mode",
+        "json",
+        "-p",
         "--no-context-files",
         "--no-skills",
+        "--no-extensions",
+        "--no-tools",
         "--thinking",
         config.thinkingLevel,
-        `@${promptPath}`,
+        "--append-system-prompt",
+        promptPath,
+        MUSOU_RUN_TRIGGER_PROMPT,
       ],
       cwd: ctx.cwd,
       timeoutMs: config.timeoutMs,
@@ -805,7 +841,9 @@ function getRunFiles(tempDir: string): MusouRunFiles {
 }
 
 function parseProposalArray(raw: string): { ok: true; proposals: ParsedProposal[] } | { ok: false; error: string } {
-  const candidates = [raw, stripOuterMarkdownFence(raw)].filter((value, index, array) => array.indexOf(value) === index);
+  const candidates = [raw, stripOuterMarkdownFence(raw), extractStandaloneJsonArray(raw)]
+    .filter((value): value is string => typeof value === "string" && value.trim() !== "")
+    .filter((value, index, array) => array.indexOf(value) === index);
 
   for (const candidate of candidates) {
     try {
@@ -826,6 +864,103 @@ function stripOuterMarkdownFence(raw: string): string {
   const trimmed = raw.trim();
   const match = trimmed.match(/^```(?:json)?\s*\n([\s\S]*?)\n```$/i);
   return match?.[1]?.trim() ?? trimmed;
+}
+
+function parseJsonModeAssistantOutput(raw: string): JsonModeAssistantOutput | null {
+  let lastAssistant: JsonModeAssistantOutput | null = null;
+
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    let event: any;
+    try {
+      event = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+
+    if (event?.type !== "message_end" || !event.message || event.message.role !== "assistant") continue;
+
+    lastAssistant = {
+      text: extractAssistantText(event.message),
+      errorMessage:
+        typeof event.message.errorMessage === "string" && event.message.errorMessage.trim() !== ""
+          ? event.message.errorMessage
+          : null,
+    };
+  }
+
+  return lastAssistant;
+}
+
+function extractAssistantText(message: { content?: unknown }): string {
+  if (!Array.isArray(message.content)) return "";
+  return message.content
+    .map((part) => {
+      if (!part || typeof part !== "object") return "";
+      const typedPart = part as { type?: unknown; text?: unknown };
+      return typedPart.type === "text" && typeof typedPart.text === "string" ? typedPart.text : "";
+    })
+    .join("");
+}
+
+function extractStandaloneJsonArray(raw: string): string | null {
+  let best: string | null = null;
+
+  for (let start = 0; start < raw.length; start += 1) {
+    if (raw[start] !== "[") continue;
+
+    const lineStart = raw.lastIndexOf("\n", start - 1) + 1;
+    if (raw.slice(lineStart, start).trim() !== "") continue;
+
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+
+    for (let index = start; index < raw.length; index += 1) {
+      const char = raw[index]!;
+
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (char === "\\") {
+          escaped = true;
+        } else if (char === '"') {
+          inString = false;
+        }
+        continue;
+      }
+
+      if (char === '"') {
+        inString = true;
+        continue;
+      }
+      if (char === "[") {
+        depth += 1;
+        continue;
+      }
+      if (char !== "]") continue;
+
+      depth -= 1;
+      if (depth !== 0) continue;
+
+      const nextLineBreak = raw.indexOf("\n", index + 1);
+      const lineEnd = nextLineBreak === -1 ? raw.length : nextLineBreak;
+      if (raw.slice(index + 1, lineEnd).trim() !== "") break;
+
+      const candidate = raw.slice(start, index + 1);
+      try {
+        const parsed = JSON.parse(candidate);
+        if (Array.isArray(parsed)) best = candidate;
+      } catch {
+        // try the next array candidate
+      }
+      break;
+    }
+  }
+
+  return best;
 }
 
 function normalizeProposal(proposal: ParsedProposal, targets: MusouTargetFile[], config: MusouConfig, cwd: string): Proposal | null {
@@ -1005,130 +1140,30 @@ async function reviewProposalUi(
   index: number,
   total: number,
 ): Promise<ReviewAction> {
-  const diffLines = buildProposalDiffLines(proposal);
-
-  return ctx.ui.custom<ReviewAction>((tui, theme, _kb, done) => {
-    let scroll = 0;
-
-    return {
-      render: (width: number) => {
-        const rule = theme.fg("dim", "─".repeat(Math.max(width, 1)));
-        const section = (label: string) => theme.fg("dim", `── ${label} ${"─".repeat(Math.max(0, width - label.length - 4))}`);
-
-        const header = [
-          rule,
-          theme.fg("accent", theme.bold(`Musou Proposal ${index} of ${total}`)),
-          rule,
-          section("Target"),
-          `${proposal.targetLabel}`,
-          `${proposal.targetPath}`,
-          section("Reason"),
-          `${proposal.reason}`,
-          section("Files"),
-          ...proposal.fileChanges.map((file) => `- ${file.relativePath}${file.originalContent === null ? " (new)" : ""}`),
-          section("Controls"),
-          theme.fg("dim", "[A] Accept   [D] Discard   [Q] Quit   [↑↓/j/k] Scroll"),
-          theme.fg(
-            "dim",
-            `Showing lines ${Math.min(scroll + 1, diffLines.length)}-${Math.min(scroll + REVIEW_VIEWPORT_LINES, diffLines.length)} of ${diffLines.length}`,
-          ),
-          rule,
-          section("Diff"),
-        ];
-
-        const viewport = diffLines.slice(scroll, scroll + REVIEW_VIEWPORT_LINES).map((line) => {
-          if (line.startsWith("+ ")) return theme.fg("success", line);
-          if (line.startsWith("- ")) return theme.fg("error", line);
-          if (line.startsWith("@@") || line.startsWith("---") || line.startsWith("+++")) return theme.fg("accent", line);
-          if (line.startsWith("===")) return theme.fg("accent", theme.bold(line));
-          return line;
-        });
-
-        const wrapped: string[] = [];
-        for (const line of [...header, ...viewport, rule]) {
-          const segments = wrapTextWithAnsi(line, Math.max(width, 1));
-          wrapped.push(...(segments.length > 0 ? segments.map((segment) => truncateToWidth(segment, width)) : [""]));
-        }
-        return wrapped;
-      },
-      invalidate: () => {},
-      handleInput: (data: string) => {
-        if (matchesKey(data, Key.up) || data === "k") {
-          scroll = Math.max(0, scroll - 1);
-          tui.requestRender();
-          return;
-        }
-        if (matchesKey(data, Key.down) || data === "j") {
-          scroll = Math.min(Math.max(0, diffLines.length - REVIEW_VIEWPORT_LINES), scroll + 1);
-          tui.requestRender();
-          return;
-        }
-        if (matchesKey(data, Key.pageUp)) {
-          scroll = Math.max(0, scroll - REVIEW_VIEWPORT_LINES);
-          tui.requestRender();
-          return;
-        }
-        if (matchesKey(data, Key.pageDown)) {
-          scroll = Math.min(Math.max(0, diffLines.length - REVIEW_VIEWPORT_LINES), scroll + REVIEW_VIEWPORT_LINES);
-          tui.requestRender();
-          return;
-        }
-        if (matchesKey(data, Key.enter) || data.toLowerCase() === "a") {
-          done("accept");
-          return;
-        }
-        if (data.toLowerCase() === "d") {
-          done("discard");
-          return;
-        }
-        if (matchesKey(data, Key.escape) || data.toLowerCase() === "q") {
-          done("quit");
-        }
-      },
-    };
-  });
-}
-
-function buildProposalDiffLines(proposal: Proposal): string[] {
-  const lines: string[] = [];
-
-  for (const change of proposal.fileChanges) {
-    lines.push(`=== ${change.relativePath} ===`);
-    lines.push(...buildDiffLines(change.originalContent ?? "", change.proposedContent));
-    lines.push("");
-  }
-
-  return lines.length > 0 ? lines : ["@@", "  (no visible file changes)"];
-}
-
-function buildDiffLines(original: string, proposed: string): string[] {
-  const patch = structuredPatch("current", "proposed", original, proposed, "", "", { context: REVIEW_DIFF_CONTEXT_LINES });
-  const lines = ["--- current", "+++ proposed"];
-
-  if (patch.hunks.length === 0) {
-    return [...lines, "@@", "  (no visible line changes)"];
-  }
-
-  for (const hunk of patch.hunks) {
-    lines.push(`@@ ${formatUnifiedRange("-", hunk.oldStart, hunk.oldLines)} ${formatUnifiedRange("+", hunk.newStart, hunk.newLines)} @@`);
-    lines.push(...hunk.lines.map(formatDiffDisplayLine));
-  }
-
-  return lines;
-}
-
-function formatUnifiedRange(prefix: "-" | "+", start: number, count: number): string {
-  if (count === 0) return `${prefix}${start},0`;
-  if (count === 1) return `${prefix}${start}`;
-  return `${prefix}${start},${count}`;
-}
-
-function formatDiffDisplayLine(line: string): string {
-  if (line.startsWith("+")) return `+ ${line.slice(1)}`;
-  if (line.startsWith("-")) return `- ${line.slice(1)}`;
-  if (line.startsWith(" ")) return `  ${line.slice(1)}`;
-  if (line.startsWith("\\")) return `  ${line}`;
-  return line;
+  return ctx.ui.custom<ReviewAction>(
+    (tui, theme, _kb, done) =>
+      new MusouReviewOverlay(
+        tui,
+        theme,
+        {
+          targetLabel: proposal.targetLabel,
+          targetPath: proposal.targetPath,
+          reason: proposal.reason,
+          fileChanges: proposal.fileChanges.map((file) => ({
+            relativePath: file.relativePath,
+            originalContent: file.originalContent,
+            proposedContent: file.proposedContent,
+          })),
+        },
+        index,
+        total,
+        done,
+      ),
+    {
+      overlay: true,
+      overlayOptions: MusouReviewOverlay.overlayOptions(),
+    },
+  );
 }
 
 async function readJsonIfExists(path: string): Promise<Record<string, unknown> | null> {

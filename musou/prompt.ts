@@ -1,42 +1,38 @@
 export const MUSOU_PROMPT_INSTRUCTIONS = `
-Analyze this session as a short postmortem. Propose only persistent, high-value learnings that would likely have prevented noticeable friction if they had existed before the session.
 
-Look for repeated corrections or preferences, repeated tool mistakes, rediscovered workflows, and avoidable backtracking.
+### Instructions
 
-Only propose something if it is repeated or persistent, generalizable beyond this session, not already covered well enough, and realistically fixable by AGENTS.md or a skill. Prefer [] over weak ideas. Return at most 3 proposals.
+Analyze the current session and propose durable improvements to persistent instruction files. Only propose repeated or clearly persistent issues that matter beyond this session and are not already covered well enough. Use AGENTS.md for behavior, preferences, and judgment. Use skills for reusable procedures, workflows, scripts, references, and templates. Return exactly one JSON array and nothing else. No prose. No markdown fences. The first non-whitespace character of your response must be [ and the last non-whitespace character must be ]. If there is no strong proposal, return []. If you are about to explain, critique, or justify in prose, return [] instead.
 
-Use AGENTS.md for behavior, judgment, and preferences. Use skills for reusable procedures, checklists, command recipes, scripts, references, or workflows. If unsure, prefer AGENTS.md.
-
-Return a JSON array only. Each element has this shape:
+Each element must have this shape:
 {
   "target": "global-agents" | "project-agents" | "global-skill:<name-or-existing-id>" | "project-skill:<name-or-existing-id>",
   "reason": "<one sentence naming the repeated friction and why this change would help>",
   "files": [
     {
       "path": "<file path>",
-      "content": "<full new content for that file>"
+      "content": "<complete new content of that file>"
     }
   ]
 }
 
 Rules:
-- files is required for every target.
+- files is required.
+- Do not critique or explain the prompt, the codebase, or the target files outside the JSON array.
 - Use the exact provided target id when updating an existing target.
-- Each file.content must be the COMPLETE new content of that file, not a diff.
+- Each file.content must be the COMPLETE new file content, not a diff.
 - Preserve unrelated existing content and make the smallest effective change.
 - Files not listed stay unchanged.
-- Each file.content must stay within its shown cap. New files use the default per-file cap shown in context.
 - For AGENTS.md targets and existing root single-file markdown skills, files must contain exactly one entry matching the existing filename.
-- For skill directory targets, file.path values must be relative to the skill root, for example: SKILL.md, scripts/process.sh, references/api.md.
-- file.path must not be absolute and must not contain .. segments.
-- Text files only. Do not propose binary files, images, archives, or base64 blobs.
-- New global skills must use target global-skill:<name> and will be created under {{GLOBAL_SKILL_ROOT}}/<name>/
-- New project skills must use target project-skill:<name> and will be created under {{PROJECT_SKILL_ROOT}}/<name>/
-- New skills must include SKILL.md. New SKILL.md files must use Agent Skills frontmatter, and the frontmatter name must exactly match the skill name.
+- For skill directory targets, file.path must be relative to the skill root. No absolute paths. No . or .. segments.
+- Text files only.
+- New global skills use target global-skill:<name> and are created under {{GLOBAL_SKILL_ROOT}}/<name>/
+- New project skills use target project-skill:<name> and are created under {{PROJECT_SKILL_ROOT}}/<name>/
+- New skills must include SKILL.md with Agent Skills frontmatter. The frontmatter name must exactly match the skill name and include a description.
 - Skill names must be 1-64 characters of lowercase letters, numbers, and single hyphens.
-- Prefer consolidating similar existing rules over adding new ones.
+- Proposed content must fit the shown cap. Some reference files may already exceed cap; ignore that. If a useful change cannot fit, do not propose that file.
 
-Examples:
+### Examples:
 []
 
 [
@@ -71,8 +67,8 @@ Examples:
 `;
 
 export function renderMusouPromptInstructions(globalSkillRoot: string, projectSkillRoot: string): string {
-	return MUSOU_PROMPT_INSTRUCTIONS.replace("{{GLOBAL_SKILL_ROOT}}", globalSkillRoot).replace(
-		"{{PROJECT_SKILL_ROOT}}",
-		projectSkillRoot,
-	);
+  return MUSOU_PROMPT_INSTRUCTIONS.replace("{{GLOBAL_SKILL_ROOT}}", globalSkillRoot).replace(
+    "{{PROJECT_SKILL_ROOT}}",
+    projectSkillRoot,
+  );
 }
